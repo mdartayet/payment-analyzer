@@ -27,6 +27,10 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
         const ultimo_dia_mes = fecha_actual.clone().endOf('month');
         const fecha_corte = fecha_actual.clone().add(30 - d_mora, 'days');
 
+        // PASO PREVIO: Detectar intención negativa
+        const negativas = ['no voy a pagar', 'no puedo pagar', 'no tengo dinero', 'no tengo plata', 'imposible', 'no quiero pagar', 'no voy a cancelar', 'no tengo para pagar', 'no lo hare', 'no lo haré'];
+        const es_negativa = negativas.some(n => client_input.includes(n));
+
         // Extraer pagos con el motor robusto CORREGIDO para Español
         const pagos = extraerPagosInteligente(client_input, fecha_actual, valor_exigible);
 
@@ -40,7 +44,10 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
         let is_acceptable = true;
         let razon_rechazo = null;
 
-        if (max_pago_fecha.isAfter(ultimo_dia_mes, 'day')) {
+        if (es_negativa) {
+            is_acceptable = false;
+            razon_rechazo = "negativa_pago";
+        } else if (max_pago_fecha.isAfter(ultimo_dia_mes, 'day')) {
             is_acceptable = false;
             razon_rechazo = "fecha_fuera_del_mes";
         } else if (suma_pagos < (valor_exigible - 0.01)) {
