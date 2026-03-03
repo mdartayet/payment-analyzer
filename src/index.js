@@ -1,113 +1,227 @@
 const express = require('express');
-const bodyParser = require('body-parser');
-const { format, addDays, isSameMonth, isAfter, startOfDay, isSameDay } = require('date-fns');
-const dateFnsTz = require('date-fns-tz');
-const chrono = require('chrono-node');
-
-// Detectar función de zona horaria
-const convertToZoned = dateFnsTz.toZonedTime || dateFnsTz.utcToZonedTime;
+const { parseDate } = require('chrono-node');
+const moment = require('moment-timezone');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const TIMEZONE = 'America/Guayaquil';
+app.use(express.json());
 
-app.use(bodyParser.json());
+// Configuración de zona horaria
+moment.tz.setDefault('America/Guayaquil');
+
+const es = {
+    months: ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'],
+    weekdays: ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado']
+};
 
 /**
- * Lógica para manejar el "Día de la semana" (si es hoy, pasar al siguiente)
+ * Endpoint con pagos_consolidados
+ * POST /api/analizar-promesa-pago
  */
-function refineDate(parsedDate, referenceDate) {
-    // Si la fecha parseada es HOY, chrono-node a veces asume que es hoy.
-    // Para cobranzas, si hoy es martes y dices "el martes", te refieres al próximo.
-    if (isSameDay(parsedDate, referenceDate)) {
-        return addDays(parsedDate, 7);
-    }
-    return parsedDate;
-}
-
 app.post('/api/analizar-promesa-pago', (req, res) => {
     try {
-        let { client_input, valor_exigible, dias_mora } = req.body;
+        const data = req.body;
 
-        if (!client_input || valor_exigible === undefined || dias_mora === undefined) {
-            return res.status(400).json({ error: 'Faltan parámetros requeridos.' });
+        // Inputs
+        const client_input = data.client_input ? data.client_input.toLowerCase() : '';
+        const valor_exigible = parseFloat(data.valor_exigible) || 0;
+        const dias_mora = parseInt(data.dias_mora) || 0;
+
+        // Fecha actual en Ecuador
+        const fecha_actual = moment.tz('America/Guayaquil');
+
+        // PASO 1: Calcular fecha de corte
+        const dias_hasta_corte = 30 - dias_mora;
+        const fecha_corte = fecha_actual.clone().add(dias_hasta_corte, 'days');
+
+        // PASO 2: Último día del mes
+        const ultimo_dia_mes = fecha_actual.clone().endOf('month');
+
+        // PASO 3: Extraer pagos con NLP
+        const pagos = extraerPagosNLP(client_input, fecha_actual);
+
+        // PASO 4: Calcular suma
+        const suma_pagos = pagos.reduce((sum, p) => sum + p.monto, 0);
+
+        let max_pago_fecha = fecha_actual.clone();
+        if (pagos.length > 0) {
+            max_pago_fecha = moment.max(pagos.map(p => p.fecha_exacta));
         }
 
-        const v_exigible = parseFloat(valor_exigible);
-        const d_mora = parseInt(dias_mora);
-
-        // 1. Configurar Referencia Temporal (Ecuador)
-        const now = new Date();
-        const fecha_actual_local = convertToZoned(now, TIMEZONE);
-        const hoy_solo_fecha = startOfDay(fecha_actual_local);
-
-        // 2. Extraer Montos
-        const montos_encontrados = client_input.match(/\d+(\.\d+)?/g) || [];
-        const suma_pagos = montos_encontrados.reduce((acc, curr) => acc + parseFloat(curr), 0);
-
-        // 3. Extraer Fechas Abstracciones (NLP)
-        // Usamos el locale de español de chrono
-        const results = chrono.es.parse(client_input, hoy_solo_fecha);
-
-        let max_pago_date = addDays(hoy_solo_fecha, 1); // Default mañana si no detecta nada
-
-        if (results.length > 0) {
-            // Obtener la fecha más lejana encontrada en el texto
-            const dates = results.map(r => {
-                let d = r.start.date();
-                return refineDate(d, hoy_solo_fecha);
-            });
-            max_pago_date = new Date(Math.max(...dates));
-        }
-
-        const max_pago_fecha_str = format(max_pago_date, 'yyyy-MM-dd');
-
-        // 4. Cálculos de Corte
-        const dias_para_corte = 30 - d_mora;
-        const fecha_corte = addDays(hoy_solo_fecha, dias_para_corte);
-        const fecha_corte_str = format(fecha_corte, 'yyyy-MM-dd');
-
-        // Nueva cuota: Si el pago es EN o DESPUÉS de la fecha de corte
-        const hay_nueva_cuota = isAfter(max_pago_date, fecha_corte) || isSameDay(max_pago_date, fecha_corte);
-        const faltante = v_exigible - suma_pagos;
-
-        // 5. Validaciones de Reglas del Banco
+        // PASO 5: Validar prohibiciones
         let is_acceptable = true;
         let razon_rechazo = null;
 
-        // Regla 1: Mes actual
-        if (!isSameMonth(max_pago_date, hoy_solo_fecha)) {
+        // PROHIBICIÓN 1: Fecha fuera del mes
+        if (max_pago_fecha.isAfter(ultimo_dia_mes, 'day')) {
             is_acceptable = false;
-            razon_rechazo = 'Propuesta fuera del mes actual.';
+            razon_rechazo = "fecha_fuera_del_mes";
         }
 
-        // Regla 2: Suma completa
-        if (suma_pagos < v_exigible) {
+        // PROHIBICIÓN 2: Suma insuficiente
+        if (suma_pagos < valor_exigible) {
             is_acceptable = false;
-            const msgMonto = `Monto insuficiente (faltan $${Math.max(0, faltante).toFixed(2)}).`;
-            razon_rechazo = razon_rechazo ? `${razon_rechazo} ${msgMonto}` : msgMonto;
+            razon_rechazo = "suma_no_cubre";
         }
 
-        return res.json({
-            is_acceptable,
-            fecha_corte_mes: fecha_corte_str,
-            hay_nueva_cuota,
-            suma_pagos: parseFloat(suma_pagos.toFixed(2)),
-            max_pago_fecha: max_pago_fecha_str,
-            faltante: Math.max(0, parseFloat(faltante.toFixed(2))),
-            razon_rechazo,
-            debug: {
-                texto_detectado: results.length > 0 ? results.map(r => r.text) : "ninguno",
-                fecha_referencia: format(hoy_solo_fecha, 'yyyy-MM-dd')
-            }
-        });
+        // PASO 6: Detectar nueva cuota
+        const hay_nueva_cuota = max_pago_fecha.isSameOrAfter(fecha_corte, 'day');
+
+        // PASO 7: Construir pagos_consolidados
+        const pagos_consolidados = pagos.map((pago, index) => ({
+            numero: index + 1,
+            monto: pago.monto,
+            fecha_verbal_original: pago.fecha_verbal_original,
+            fecha_exacta: pago.fecha_exacta.format('YYYY-MM-DD'),
+            fecha_texto_resumen: formatearFechaTexto(pago.fecha_exacta),
+            es_en_fecha_corte: pago.fecha_exacta.isSame(fecha_corte, 'day'),
+            genera_nueva_cuota: pago.fecha_exacta.isSameOrAfter(fecha_corte, 'day')
+        }));
+
+        // PASO 8: Construir respuesta
+        const respuesta = {
+            is_acceptable: is_acceptable,
+            fecha_actual: fecha_actual.format('YYYY-MM-DD'),
+            fecha_corte_mes: fecha_corte.format('YYYY-MM-DD'),
+            hay_nueva_cuota: hay_nueva_cuota,
+            suma_pagos: suma_pagos,
+            max_pago_fecha: max_pago_fecha.format('YYYY-MM-DD'),
+            valor_exigible: valor_exigible,
+            faltante: valor_exigible - suma_pagos,
+            pagos_consolidados: pagos_consolidados,
+            razon_rechazo: razon_rechazo
+        };
+
+        res.json(respuesta);
 
     } catch (error) {
-        console.error('SERVER ERROR:', error);
-        return res.status(500).json({ error: 'Error procesando NLP temporal: ' + error.message });
+        res.status(500).json({
+            error: error.message,
+            message: 'Error al procesar la promesa de pago'
+        });
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`✅ Analizador Inteligente v2 listo en puerto ${PORT}`);
+/**
+ * Extrae pagos usando chrono-node para NLP
+ */
+function extraerPagosNLP(client_input, fecha_actual) {
+    const pagos = [];
+
+    // Dividir por "y" o comas
+    const partes = client_input.replace(/,/g, ' y ').split(' y ');
+
+    for (const parte of partes) {
+        const parte_trim = parte.trim();
+
+        // Extraer número (monto)
+        const numeros = parte_trim.match(/\d+(?:\.\d+)?/g);
+        if (!numeros) continue;
+
+        const monto = parseFloat(numeros[0]);
+
+        // Extraer fecha verbal
+        let fecha_verbal = parte_trim
+            .replace(/\d+(?:\.\d+)?/g, '')
+            .replace(/\$/g, '')
+            .replace(/dólares?/g, '')
+            .trim();
+
+        // Usar chrono-node para parsear
+        let fecha_exacta = null;
+
+        try {
+            const resultado_chrono = parseDate(fecha_verbal, fecha_actual.toDate());
+            if (resultado_chrono) {
+                fecha_exacta = moment(resultado_chrono).tz('America/Guayaquil');
+            }
+        } catch (e) {
+            // Fallback si chrono falla
+        }
+
+        // Si chrono no funcionó, usar fallback
+        if (!fecha_exacta) {
+            fecha_exacta = resolverFechaFallback(fecha_verbal, fecha_actual);
+        }
+
+        pagos.push({
+            monto: monto,
+            fecha_verbal_original: fecha_verbal,
+            fecha_exacta: fecha_exacta
+        });
+    }
+
+    // Ordenar por fecha
+    pagos.sort((a, b) => a.fecha_exacta.diff(b.fecha_exacta));
+
+    return pagos;
+}
+
+/**
+ * Fallback para resolver fechas si chrono falla
+ */
+function resolverFechaFallback(fecha_verbal, fecha_actual) {
+    fecha_verbal = fecha_verbal.toLowerCase().trim();
+
+    // Casos simples
+    if (fecha_verbal === 'hoy' || fecha_verbal === 'hoy mismo') {
+        return fecha_actual.clone();
+    }
+
+    if (fecha_verbal === 'mañana') {
+        return fecha_actual.clone().add(1, 'day');
+    }
+
+    if (fecha_verbal === 'pasado mañana') {
+        return fecha_actual.clone().add(2, 'days');
+    }
+
+    // Días de la semana
+    const diasSemana = {
+        'lunes': 1, 'martes': 2, 'miércoles': 3, 'miercoles': 3,
+        'jueves': 4, 'viernes': 5, 'sábado': 6, 'sabado': 6, 'domingo': 0
+    };
+
+    for (const [dia, num] of Object.entries(diasSemana)) {
+        if (fecha_verbal.includes(dia)) {
+            let fecha = fecha_actual.clone();
+            const hoy_dia = fecha.day(); // 0 = domingo, 1 = lunes, etc.
+
+            let dias_adelante = (num - hoy_dia + 7) % 7;
+
+            // Si es hoy, ir al próximo
+            if (dias_adelante === 0) {
+                dias_adelante = 7;
+            }
+
+            return fecha.add(dias_adelante, 'days');
+        }
+    }
+
+    // Si no se puede resolver, retornar fecha actual
+    return fecha_actual.clone();
+}
+
+/**
+ * Formatea fecha a texto en español para el resumen
+ * Ej: "viernes 7 de marzo"
+ */
+function formatearFechaTexto(fecha) {
+    const dia_semana = es.weekdays[fecha.day()];
+    const numero_dia = fecha.date();
+    const mes = es.months[fecha.month()];
+
+    return `${dia_semana} ${numero_dia} de ${mes}`;
+}
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Servicio corriendo en puerto ${PORT}`);
+    console.log(`Endpoint: POST /api/analizar-promesa-pago`);
+});
+
+module.exports = app;
