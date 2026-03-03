@@ -129,7 +129,7 @@ function extraerPagosInteligente(input, fecha_ref, total_deuda) {
             monto = parseFloat(numMatch[0]);
         } else if (p.includes('mitad')) {
             monto = total_deuda / 2;
-        } else if (p.includes('resto') || p.includes('saldo') || p.includes('demas') || p.includes('total') || p.includes('completo')) {
+        } else if (p.includes('todo') || p.includes('todos') || p.includes('toda') || p.includes('resto') || p.includes('saldo') || p.includes('demas') || p.includes('total') || p.includes('completo')) {
             monto = Math.max(0, total_deuda - suma_acumulada);
         }
 
