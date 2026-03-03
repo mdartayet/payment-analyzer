@@ -44,9 +44,20 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
         let is_acceptable = true;
         let razon_rechazo = null;
 
+        // NUEVA LÓGICA: Validar Fecha Contable (Registro)
+        // En Ecuador, pagos de viernes, sábado o domingo se registran el lunes.
+        // Si ese lunes es de otro mes, el banco no lo acepta para el cierre actual.
+        const tiene_registro_fuera_mes = pagos.some(p => {
+            const f_reg = calcularFechaRegistro(p.fecha_exacta);
+            return f_reg.isAfter(ultimo_dia_mes, 'day');
+        });
+
         if (es_negativa) {
             is_acceptable = false;
             razon_rechazo = "negativa_pago";
+        } else if (tiene_registro_fuera_mes) {
+            is_acceptable = false;
+            razon_rechazo = "fecha_fuera_del_mes";
         } else if (max_pago_fecha.isAfter(ultimo_dia_mes, 'day')) {
             is_acceptable = false;
             razon_rechazo = "fecha_fuera_del_mes";
@@ -57,15 +68,20 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
 
         const hay_nueva_cuota = max_pago_fecha.isSameOrAfter(fecha_corte, 'day');
 
-        const pagos_consolidados = pagos.map((p, i) => ({
-            numero: i + 1,
-            monto: p.monto,
-            fecha_verbal_original: p.fecha_verbal_original,
-            fecha_exacta: p.fecha_exacta.format('YYYY-MM-DD'),
-            fecha_texto_resumen: formatearFechaTexto(p.fecha_exacta),
-            es_en_fecha_corte: p.fecha_exacta.isSame(fecha_corte, 'day'),
-            genera_nueva_cuota: p.fecha_exacta.isSameOrAfter(fecha_corte, 'day')
-        }));
+        const pagos_consolidados = pagos.map((p, i) => {
+            const f_reg = calcularFechaRegistro(p.fecha_exacta);
+            return {
+                numero: i + 1,
+                monto: p.monto,
+                fecha_verbal_original: p.fecha_verbal_original,
+                fecha_exacta: p.fecha_exacta.format('YYYY-MM-DD'),
+                fecha_registro_contable: f_reg.format('YYYY-MM-DD'),
+                fecha_texto_resumen: formatearFechaTexto(p.fecha_exacta),
+                es_registro_proximo_mes: !f_reg.isSame(p.fecha_exacta, 'month'),
+                es_en_fecha_corte: p.fecha_exacta.isSame(fecha_corte, 'day'),
+                genera_nueva_cuota: p.fecha_exacta.isSameOrAfter(fecha_corte, 'day')
+            };
+        });
 
         res.json({
             is_acceptable,
@@ -179,6 +195,20 @@ function resolverFechaFallback(v, ref) {
 
 function formatearFechaTexto(fecha) {
     return `${es.weekdays[fecha.day()]} ${fecha.date()} de ${es.months[fecha.month()]}`;
+}
+
+/**
+ * Lógica de Ecuador: Pagos en Viernes/Sáb/Dom se registran el Lunes.
+ */
+function calcularFechaRegistro(fecha) {
+    const f = fecha.clone();
+    const dia = f.day(); // 0: Dom, 5: Vie, 6: Sáb
+
+    if (dia === 5) return f.add(3, 'days'); // Viernes -> Lunes
+    if (dia === 6) return f.add(2, 'days'); // Sábado -> Lunes
+    if (dia === 0) return f.add(1, 'day');  // Domingo -> Lunes
+
+    return f;
 }
 
 const PORT = process.env.PORT || 3000;
