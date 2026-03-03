@@ -1,85 +1,82 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const { format, addDays, isSameMonth, parseISO, isAfter, startOfDay } = require('date-fns');
-const { utcToZonedTime, zonedTimeToUtc } = require('date-fns-tz');
+const { toZonedTime } = require('date-fns-tz');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const TIMEZONE = 'America/Guayaquil'; // Zona horaria Ecuador
+const TIMEZONE = 'America/Guayaquil';
 
 app.use(bodyParser.json());
 
-/**
- * Endpoint para analizar promesas de pago
- */
 app.post('/api/analizar-promesa-pago', (req, res) => {
     try {
-        const { client_input, valor_exigible, dias_mora } = req.body;
+        let { client_input, valor_exigible, dias_mora } = req.body;
 
+        // Validación y limpieza de datos de entrada
         if (!client_input || valor_exigible === undefined || dias_mora === undefined) {
-            return res.status(400).json({ error: 'Faltan parámetros requeridos: client_input, valor_exigible, dias_mora' });
+            return res.status(400).json({ error: 'Faltan parámetros: client_input, valor_exigible y dias_mora son obligatorios.' });
         }
 
-        // 1. Configurar Fechas (Zona Horaria Ecuador)
+        // Asegurar que los números sean números (evita errores de strings en Postman)
+        const v_exigible = parseFloat(valor_exigible);
+        const d_mora = parseInt(dias_mora);
+
+        if (isNaN(v_exigible) || isNaN(d_mora)) {
+            return res.status(400).json({ error: 'valor_exigible y dias_mora deben ser números válidos.' });
+        }
+
+        // 1. Configurar Fechas
         const now = new Date();
-        const fecha_actual_local = utcToZonedTime(now, TIMEZONE);
+        const fecha_actual_local = toZonedTime(now, TIMEZONE);
         const hoy_solo_fecha = startOfDay(fecha_actual_local);
 
-        // 2. Extraer montos y fechas del client_input (Lógica simple para demostración)
-        // En un caso real aquí usarías un modelo de lenguaje o regex más complejo.
-        // Simulamos la extracción:
+        // 2. Extraer montos del input
         const montos_encontrados = client_input.match(/\d+/g) || [];
         const suma_pagos = montos_encontrados.reduce((acc, curr) => acc + parseFloat(curr), 0);
 
-        // Simulamos fechas: Para este ejemplo, asumiremos que "hoy" es la fecha propuesta
-        // En producción, aquí integraríamos una IA para parsear "el jueves" a una fecha real.
-        const max_pago_fecha = format(addDays(fecha_actual_local, 3), 'yyyy-MM-dd'); // Simulado: 3 días después
-        const max_pago_date = parseISO(max_pago_fecha);
+        // Simulación de fecha de pago (3 días después por defecto si no se detecta otra)
+        const max_pago_date = addDays(hoy_solo_fecha, 3);
+        const max_pago_fecha_str = format(max_pago_date, 'yyyy-MM-dd');
 
-        // 3. Cálculos automáticos
-        const dias_para_corte = 30 - dias_mora;
-        const fecha_corte = addDays(fecha_actual_local, dias_para_corte);
+        // 3. Cálculos
+        const dias_para_corte = 30 - d_mora;
+        const fecha_corte = addDays(hoy_solo_fecha, dias_para_corte);
         const fecha_corte_str = format(fecha_corte, 'yyyy-MM-dd');
 
-        const hay_nueva_cuota = isAfter(max_pago_date, fecha_corte) || max_pago_fecha === fecha_corte_str;
-        const faltante = valor_exigible - suma_pagos;
+        const hay_nueva_cuota = isAfter(max_pago_date, fecha_corte);
+        const faltante = v_exigible - suma_pagos;
 
-        // 4. Validaciones de prohibición
+        // 4. Validaciones
         let is_acceptable = true;
         let razon_rechazo = null;
 
-        // Prohibición 1: Fecha fuera del mes actual
-        if (!isSameMonth(max_pago_date, fecha_actual_local)) {
+        if (!isSameMonth(max_pago_date, hoy_solo_fecha)) {
             is_acceptable = false;
-            razon_rechazo = 'La fecha de pago propuesta está fuera del mes actual.';
+            razon_rechazo = 'Fecha fuera del mes actual.';
         }
 
-        // Prohibición 2: Suma menor al valor exigible
-        if (suma_pagos < valor_exigible) {
+        if (suma_pagos < v_exigible) {
             is_acceptable = false;
-            razon_rechazo = razon_rechazo ? `${razon_rechazo} Además, la suma de los pagos es menor al valor adeudado.` : 'La suma propuesta es menor al valor exigible.';
+            razon_rechazo = razon_rechazo ? `${razon_rechazo} Monto insuficiente.` : 'La suma de pagos es menor al valor exigible.';
         }
 
-        // 5. Respuesta JSON
-        const response = {
+        return res.json({
             is_acceptable,
             fecha_corte_mes: fecha_corte_str,
             hay_nueva_cuota,
             suma_pagos,
-            max_pago_fecha,
+            max_pago_fecha: max_pago_fecha_str,
             faltante: Math.max(0, faltante),
             razon_rechazo
-        };
-
-        return res.json(response);
+        });
 
     } catch (error) {
-        console.error('Error procesando la solicitud:', error);
-        return res.status(500).json({ error: 'Error interno al procesar el análisis de pago' });
+        console.error('SERVER ERROR:', error);
+        return res.status(500).json({ error: 'Error interno en el procesamiento de fechas.' });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`✅ Servidor de Análisis de Pagos corriendo en http://localhost:${PORT}`);
-    console.log(`🌍 Zona Horaria configurada: ${TIMEZONE}`);
+    console.log(`✅ Servidor listo en puerto ${PORT}`);
 });
