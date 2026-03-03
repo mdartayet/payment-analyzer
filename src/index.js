@@ -37,7 +37,7 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
         const ultimo_dia_mes = fecha_actual.clone().endOf('month');
 
         // PASO 3: Extraer pagos con NLP
-        const pagos = extraerPagosNLP(client_input, fecha_actual);
+        const pagos = extraerPagosNLP(client_input, fecha_actual, valor_exigible);
 
         // PASO 4: Calcular suma
         const suma_pagos = pagos.reduce((sum, p) => sum + p.monto, 0);
@@ -104,27 +104,44 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
 /**
  * Extrae pagos usando chrono-node para NLP
  */
-function extraerPagosNLP(client_input, fecha_actual) {
+function extraerPagosNLP(client_input, fecha_actual, valor_exigible) {
     const pagos = [];
+    let suma_acumulada = 0;
 
     // Dividir por "y" o comas
     const partes = client_input.replace(/,/g, ' y ').split(' y ');
 
     for (const parte of partes) {
-        const parte_trim = parte.trim();
+        const parte_trim = parte.trim().toLowerCase();
 
         // Extraer número (monto)
         const numeros = parte_trim.match(/\d+(?:\.\d+)?/g);
-        if (!numeros) continue;
+        let monto = 0;
 
-        const monto = parseFloat(numeros[0]);
+        if (numeros) {
+            monto = parseFloat(numeros[0]);
+        } else if (parte_trim.includes('el resto') || parte_trim.includes('saldo') || parte_trim.includes('diferencia') || parte_trim.includes('lo demas')) {
+            monto = Math.max(0, valor_exigible - suma_acumulada);
+        } else {
+            continue; // No hay ni número ni palabra clave de saldo
+        }
+
+        // Evitar sumar dos veces si hay un monto y la palabra "resto" (ej. "el resto 500")
+        suma_acumulada += monto;
 
         // Extraer fecha verbal
         let fecha_verbal = parte_trim
             .replace(/\d+(?:\.\d+)?/g, '')
             .replace(/\$/g, '')
             .replace(/dólares?/g, '')
+            .replace(/el resto/g, '')
+            .replace(/saldo/g, '')
+            .replace(/diferencia/g, '')
+            .replace(/lo demas/g, '')
             .trim();
+
+        // Normalizar "manana" (falta tilde común en chat/voz)
+        fecha_verbal = fecha_verbal.replace(/manana/g, 'mañana');
 
         // Usar chrono-node para parsear
         let fecha_exacta = null;
@@ -167,11 +184,11 @@ function resolverFechaFallback(fecha_verbal, fecha_actual) {
         return fecha_actual.clone();
     }
 
-    if (fecha_verbal === 'mañana') {
+    if (fecha_verbal === 'mañana' || fecha_verbal === 'manana' || fecha_verbal.includes('mañana') || fecha_verbal.includes('manana')) {
         return fecha_actual.clone().add(1, 'day');
     }
 
-    if (fecha_verbal === 'pasado mañana') {
+    if (fecha_verbal === 'pasado mañana' || fecha_verbal === 'pasado manana' || fecha_verbal.includes('pasado')) {
         return fecha_actual.clone().add(2, 'days');
     }
 
