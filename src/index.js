@@ -173,10 +173,13 @@ function extraerPagosNLP(client_input, fecha_actual, valor_exigible) {
             if (resultado_chrono) {
                 fecha_exacta = moment(resultado_chrono).tz('America/Guayaquil');
 
-                // Aplicar lógica de "Próximo [Día]" si es hoy
-                const hoy_dia = fecha_actual.day();
-                const parse_dia = fecha_exacta.day();
-                if (isSameDay(fecha_exacta.toDate(), fecha_actual.toDate()) && fecha_verbal.length > 3) {
+                // Aplicar lógica de "Próximo [Día]" solo para días de la semana específicos
+                // Evitamos aplicar esto a "hoy" o fechas relativas directas
+                const v_clean = fecha_verbal.toLowerCase();
+                const diasEspeciales = ['lunes', 'martes', 'miércoles', 'miercoles', 'jueves', 'viernes', 'sábado', 'sabado', 'domingo'];
+                const contieneDiaLiteral = diasEspeciales.some(d => v_clean.includes(d));
+
+                if (contieneDiaLiteral && isSameDay(fecha_exacta.toDate(), fecha_actual.toDate()) && fecha_verbal.length > 3) {
                     fecha_exacta.add(7, 'days');
                 }
             }
