@@ -102,120 +102,162 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
 });
 
 /**
- * Extrae pagos usando chrono-node para NLP
+ * Extrae pagos usando chrono-node para NLP y lógica de negocio expandida
  */
 function extraerPagosNLP(client_input, fecha_actual, valor_exigible) {
     const pagos = [];
     let suma_acumulada = 0;
 
-    // Dividir por "y" o comas
-    const partes = client_input.replace(/,/g, ' y ').split(' y ');
+    // Normalizaciones previas del texto
+    let texto = client_input.toLowerCase()
+        .replace(/,/g, ' y ')
+        .replace(/ e /g, ' y ')
+        .replace(/ junto con /g, ' y ')
+        .replace(/ademas/g, ' y ')
+        .replace(/luego/g, ' y ')
+        .replace(/despues/g, ' y ')
+        .replace(/ahora/g, 'hoy')
+        .replace(/manana/g, 'mañana')
+        .replace(/sabado/g, 'sábado')
+        .replace(/miércoles/g, 'miércoles')
+        .replace(/miercoles/g, 'miércoles');
+
+    // Dividir por conectores
+    const partes = texto.split(' y ');
 
     for (const parte of partes) {
-        const parte_trim = parte.trim().toLowerCase();
+        const parte_trim = parte.trim();
+        if (!parte_trim) continue;
 
-        // Extraer número (monto)
-        const numeros = parte_trim.match(/\d+(?:\.\d+)?/g);
+        // --- LÓGICA DE MONTO ---
         let monto = 0;
+        const numeros = parte_trim.match(/\d+(?:\.\d+)?/g);
 
         if (numeros) {
             monto = parseFloat(numeros[0]);
+        } else if (parte_trim.includes('la mitad')) {
+            monto = valor_exigible / 2;
+        } else if (parte_trim.includes('todo') || parte_trim.includes('total') || parte_trim.includes('completo')) {
+            monto = valor_exigible - suma_acumulada;
         } else if (parte_trim.includes('el resto') || parte_trim.includes('saldo') || parte_trim.includes('diferencia') || parte_trim.includes('lo demas')) {
             monto = Math.max(0, valor_exigible - suma_acumulada);
-        } else {
-            continue; // No hay ni número ni palabra clave de saldo
+        } else if (parte_trim.includes('una parte')) {
+            // Si el cliente dice "una parte", y no hay monto, asumimos balance actual / 2 o $0 para forzar aclaración
+            monto = (valor_exigible - suma_acumulada) / 2;
         }
 
-        // Evitar sumar dos veces si hay un monto y la palabra "resto" (ej. "el resto 500")
+        if (monto <= 0 && !numeros) continue;
+
         suma_acumulada += monto;
 
-        // Extraer fecha verbal
+        // --- LÓGICA DE FECHA ---
         let fecha_verbal = parte_trim
             .replace(/\d+(?:\.\d+)?/g, '')
             .replace(/\$/g, '')
             .replace(/dólares?/g, '')
+            .replace(/la mitad/g, '')
+            .replace(/todo/g, '')
+            .replace(/total/g, '')
+            .replace(/completo/g, '')
             .replace(/el resto/g, '')
             .replace(/saldo/g, '')
             .replace(/diferencia/g, '')
             .replace(/lo demas/g, '')
+            .replace(/una parte/g, '')
             .trim();
 
-        // Normalizar "manana" (falta tilde común en chat/voz)
-        fecha_verbal = fecha_verbal.replace(/manana/g, 'mañana');
-
-        // Usar chrono-node para parsear
         let fecha_exacta = null;
 
         try {
             const resultado_chrono = parseDate(fecha_verbal, fecha_actual.toDate());
             if (resultado_chrono) {
                 fecha_exacta = moment(resultado_chrono).tz('America/Guayaquil');
-            }
-        } catch (e) {
-            // Fallback si chrono falla
-        }
 
-        // Si chrono no funcionó, usar fallback
+                // Aplicar lógica de "Próximo [Día]" si es hoy
+                const hoy_dia = fecha_actual.day();
+                const parse_dia = fecha_exacta.day();
+                if (isSameDay(fecha_exacta.toDate(), fecha_actual.toDate()) && fecha_verbal.length > 3) {
+                    fecha_exacta.add(7, 'days');
+                }
+            }
+        } catch (e) { }
+
         if (!fecha_exacta) {
             fecha_exacta = resolverFechaFallback(fecha_verbal, fecha_actual);
         }
 
         pagos.push({
-            monto: monto,
-            fecha_verbal_original: fecha_verbal,
+            monto: parseFloat(monto.toFixed(2)),
+            fecha_verbal_original: fecha_verbal || 'hoy (asumido)',
             fecha_exacta: fecha_exacta
         });
     }
 
-    // Ordenar por fecha
     pagos.sort((a, b) => a.fecha_exacta.diff(b.fecha_exacta));
-
     return pagos;
 }
 
 /**
- * Fallback para resolver fechas si chrono falla
+ * Motor de resolución de ambigüedades temporales (Business Logic)
  */
 function resolverFechaFallback(fecha_verbal, fecha_actual) {
-    fecha_verbal = fecha_verbal.toLowerCase().trim();
+    const v = fecha_verbal.toLowerCase().trim();
 
-    // Casos simples
-    if (fecha_verbal === 'hoy' || fecha_verbal === 'hoy mismo') {
-        return fecha_actual.clone();
+    // 1. Relativos Directos
+    if (v === 'hoy' || v === 'hoy mismo' || v === 'ahora' || v === 'ya') return fecha_actual.clone();
+    if (v.includes('mañana') || v.includes('manana')) return fecha_actual.clone().add(1, 'day');
+    if (v.includes('pasado mañana') || v.includes('pasado manana')) return fecha_actual.clone().add(2, 'days');
+
+    // 2. Expresiones de Cobranza
+    if (v.includes('quincena')) {
+        const dia = fecha_actual.date();
+        if (dia < 15) return fecha_actual.clone().date(15);
+        if (dia >= 15 && dia < 30) return fecha_actual.clone().endOf('month');
+        return fecha_actual.clone().add(1, 'month').date(15);
     }
 
-    if (fecha_verbal === 'mañana' || fecha_verbal === 'manana' || fecha_verbal.includes('mañana') || fecha_verbal.includes('manana')) {
-        return fecha_actual.clone().add(1, 'day');
+    if (v.includes('fin de mes') || v.includes('final de mes')) {
+        return fecha_actual.clone().endOf('month');
     }
 
-    if (fecha_verbal === 'pasado mañana' || fecha_verbal === 'pasado manana' || fecha_verbal.includes('pasado')) {
-        return fecha_actual.clone().add(2, 'days');
+    if (v.includes('ocho dias') || v.includes('8 dias') || v.includes('una semana')) {
+        return fecha_actual.clone().add(7, 'days');
     }
 
-    // Días de la semana
+    if (v.includes('quince dias') || v.includes('15 dias') || v.includes('dos semanas')) {
+        return fecha_actual.clone().add(14, 'days');
+    }
+
+    if (v.includes('fin de semana')) {
+        let f = fecha_actual.clone();
+        while (f.day() !== 6) f.add(1, 'day'); // Buscar próximo sábado
+        return f;
+    }
+
+    if (v.includes('proxima semana') || v.includes('proximo lunes')) {
+        let f = fecha_actual.clone().add(7, 'days');
+        while (f.day() !== 1) f.subtract(1, 'day'); // Ajustar al lunes de la sig semana
+        return f;
+    }
+
+    // 3. Días de la semana
     const diasSemana = {
         'lunes': 1, 'martes': 2, 'miércoles': 3, 'miercoles': 3,
         'jueves': 4, 'viernes': 5, 'sábado': 6, 'sabado': 6, 'domingo': 0
     };
 
     for (const [dia, num] of Object.entries(diasSemana)) {
-        if (fecha_verbal.includes(dia)) {
-            let fecha = fecha_actual.clone();
-            const hoy_dia = fecha.day(); // 0 = domingo, 1 = lunes, etc.
-
-            let dias_adelante = (num - hoy_dia + 7) % 7;
-
-            // Si es hoy, ir al próximo
-            if (dias_adelante === 0) {
-                dias_adelante = 7;
-            }
-
-            return fecha.add(dias_adelante, 'days');
+        if (v.includes(dia)) {
+            let f = fecha_actual.clone();
+            const hoy_num = f.day();
+            let diff = (num - hoy_num + 7) % 7;
+            if (diff === 0) diff = 7; // Si es hoy, proyectar al siguiente
+            return f.add(diff, 'days');
         }
     }
 
-    // Si no se puede resolver, retornar fecha actual
-    return fecha_actual.clone();
+    // Default: si no entiende nada, hoy + 1 día para seguridad de la promesa
+    return fecha_actual.clone().add(1, 'day');
 }
 
 /**
