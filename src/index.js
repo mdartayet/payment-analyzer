@@ -106,9 +106,9 @@ function extraerPagosInteligente(input, fecha_ref, total_deuda) {
     const pagos = [];
     let suma_acumulada = 0;
 
-    // Normalizar texto
+    // Normalizar texto y manejar conectores
     let texto = input.toLowerCase()
-        .replace(/,/g, ' y ')
+        .replace(/[,]| además | ademas | luego | después | despues | e | junto con /g, ' y ')
         .replace(/manana/g, 'mañana')
         .replace(/sabado/g, 'sábado')
         .replace(/miercoles/g, 'miércoles')
@@ -129,7 +129,7 @@ function extraerPagosInteligente(input, fecha_ref, total_deuda) {
             fecha_obj = moment(chronoRes[0].start.date()).tz('America/Guayaquil').startOf('day');
             fecha_texto_detectado = chronoRes[0].text;
 
-            // Lógica para saltar a la próxima semana si el día detectado es hoy o ya pasó en la semana actual
+            // Lógica para saltar a la próxima semana si el día detectado ya pasó o es hoy
             const diasSemana = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
             const mencionaDiaLiteral = diasSemana.some(d => p.includes(d));
 
@@ -141,16 +141,30 @@ function extraerPagosInteligente(input, fecha_ref, total_deuda) {
         // 2. Fallbacks de Fecha (Quincena, Fin de mes, etc.)
         if (!fecha_obj) {
             fecha_obj = resolverFechaFallback(p, fecha_ref);
-            fecha_texto_detectado = "relativo";
+            // Si el fallback resuelve algo basado en texto, lo ideal es quitarlo del monto
+            fecha_texto_detectado = ""; // En fallback no siempre tenemos el texto exacto
         }
 
-        // 3. Extraer Monto
+        // 3. Extraer Monto Robusto
         let texto_para_monto = p.replace(fecha_texto_detectado, "");
+
+        // Mapeo de palabras de números a dígitos
+        const mapaNumeros = {
+            'diez mil': '10000', 'cinco mil': '5000', 'cuatro mil': '4000', 'tres mil': '3000', 'dos mil': '2000', 'mil': '1000',
+            'novecientos': '900', 'ochocientos': '800', 'setecientos': '700', 'seiscientos': '600', 'quinientos': '500', 'cuatrocientos': '400', 'trescientos': '300', 'doscientos': '200', 'ciento': '100', 'cien': '100',
+            'noventa': '90', 'ochenta': '80', 'setenta': '70', 'sesenta': '60', 'cincuenta': '50', 'cuarenta': '40', 'treinta': '30', 'veinte': '20', 'diez': '10'
+        };
+
+        for (const [palabra, valor] of Object.entries(mapaNumeros)) {
+            texto_para_monto = texto_para_monto.replace(new RegExp('\\b' + palabra + '\\b', 'g'), valor);
+        }
+
         let monto = 0;
         const numMatch = texto_para_monto.match(/\d+(?:\.\d+)?/g);
 
         if (numMatch) {
-            monto = parseFloat(numMatch[0]);
+            // Sumar todos los números encontrados en esta parte (ej: "mil quinientos" -> "1000 500" -> 1500)
+            monto = numMatch.reduce((acc, curr) => acc + parseFloat(curr), 0);
         } else if (p.includes('mitad')) {
             monto = (total_deuda / 2);
         } else if (p.includes('todo') || p.includes('todos') || p.includes('toda') || p.includes('resto') || p.includes('saldo') || p.includes('demas') || p.includes('total') || p.includes('completo')) {
