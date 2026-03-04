@@ -22,14 +22,25 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
         const client_input = data.client_input ? data.client_input.toLowerCase() : '';
         const valor_exigible = parseFloat(data.valor_exigible) || 0;
         const d_mora = parseInt(data.dias_mora) || 0;
+        const count_previo = parseInt(data.negativas_consecutivas) || 0;
 
         const fecha_actual = moment.tz('America/Guayaquil').startOf('day');
         const ultimo_dia_mes = fecha_actual.clone().endOf('month');
         const fecha_corte = fecha_actual.clone().add(30 - d_mora, 'days');
 
-        // PASO PREVIO: Detectar intención negativa
-        const negativas = ['no voy a pagar', 'no puedo pagar', 'no tengo dinero', 'no tengo plata', 'imposible', 'no quiero pagar', 'no voy a cancelar', 'no tengo para pagar', 'no lo hare', 'no lo haré'];
-        const es_negativa = negativas.some(n => client_input.includes(n));
+        // PASO PREVIO: Detectar intención negativa explícita
+        const frasesNegativas = [
+            'no tengo mas', 'no tengo más', 'no voy a pagar', 'no puedo pagar',
+            'no tengo dinero', 'no tengo plata', 'no tengo para pagar', 'no tengo como',
+            'no tengo cómo', 'imposible', 'no quiero pagar', 'no voy a cancelar',
+            'no lo hare', 'no lo haré', 'ya te dije', 'ya te estoy diciendo',
+            'no me interesa', 'no puedo mas', 'no puedo más', 'es que no tengo',
+            'solo tengo como te indique', 'solo tengo como te indiqué', 'pero ya te dije',
+            'no tengo para más', 'no tengo para mas', 'no puedo dar más', 'no puedo dar mas',
+            'es todo lo que tengo', 'es todo lo que puedo'
+        ];
+
+        const cliente_se_niega = frasesNegativas.some(n => client_input.includes(n));
 
         // Extraer pagos con el motor robusto CORREGIDO para Español
         const pagos = extraerPagosInteligente(client_input, fecha_actual, valor_exigible);
@@ -44,15 +55,13 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
         let is_acceptable = true;
         let razon_rechazo = null;
 
-        // NUEVA LÓGICA: Validar Fecha Contable (Registro)
-        // En Ecuador, pagos de viernes, sábado o domingo se registran el lunes.
-        // Si ese lunes es de otro mes, el banco no lo acepta para el cierre actual.
+        // CALCULAR REGISTRO CONTABLE PARA VALIDACIÓN
         const tiene_registro_fuera_mes = pagos.some(p => {
             const f_reg = calcularFechaRegistro(p.fecha_exacta);
             return f_reg.isAfter(ultimo_dia_mes, 'day');
         });
 
-        if (es_negativa) {
+        if (cliente_se_niega) {
             is_acceptable = false;
             razon_rechazo = "negativa_pago";
         } else if (tiene_registro_fuera_mes) {
@@ -64,6 +73,14 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
         } else if (suma_pagos < (valor_exigible - 0.01)) {
             is_acceptable = false;
             razon_rechazo = "suma_no_cubre";
+        }
+
+        // Lógica de Negativas Consecutivas
+        let negativas_consecutivas = count_previo;
+        if (is_acceptable) {
+            negativas_consecutivas = 0;
+        } else if (razon_rechazo === "negativa_pago") {
+            negativas_consecutivas = count_previo + 1;
         }
 
         const hay_nueva_cuota = max_pago_fecha.isSameOrAfter(fecha_corte, 'day');
@@ -93,7 +110,9 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
             valor_exigible,
             faltante: Math.max(0, parseFloat((valor_exigible - suma_pagos).toFixed(2))),
             pagos_consolidados,
-            razon_rechazo
+            razon_rechazo,
+            cliente_se_niega,
+            negativas_consecutivas
         });
 
     } catch (error) {
