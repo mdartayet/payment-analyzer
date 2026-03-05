@@ -1,8 +1,10 @@
 const express = require('express');
+const cors = require('cors');
 const chrono = require('chrono-node');
 const moment = require('moment-timezone');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 // Configuración de zona horaria
@@ -12,6 +14,18 @@ const es = {
     months: ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'],
     weekdays: ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado']
 };
+
+/**
+ * GET /
+ * Health Check para Render
+ */
+app.get('/', (req, res) => {
+    res.json({
+        service: "Payment Analyzer API",
+        status: "active",
+        timestamp: moment().tz('America/Guayaquil').format()
+    });
+});
 
 /**
  * POST /api/analizar-promesa-pago
@@ -122,10 +136,6 @@ app.post('/api/analizar-promesa-pago', (req, res) => {
 });
 
 function extraerPagosInteligente(input, fecha_ref, total_deuda) {
-    const pagos = [];
-    let suma_acumulada = 0;
-
-    // Normalizar texto y manejar conectores
     let texto = input.toLowerCase()
         .replace(/[,]| además | ademas | luego | después | despues | e | junto con /g, ' y ')
         .replace(/manana/g, 'mañana')
@@ -133,97 +143,167 @@ function extraerPagosInteligente(input, fecha_ref, total_deuda) {
         .replace(/miercoles/g, 'miércoles')
         .replace(/[$]|dólares|dolares/g, '');
 
-    const partes = texto.split(' y ');
+    const mapaNumeros = {
+        'diez mil': '10000', 'cinco mil': '5000', 'cuatro mil': '4000', 'tres mil': '3000', 'dos mil': '2000', 'mil': '1000',
+        'novecientos': '900', 'ochocientos': '800', 'setecientos': '700', 'seiscientos': '600', 'quinientos': '500', 'cuatrocientos': '400', 'trescientos': '300', 'doscientos': '200', 'ciento': '100', 'cien': '100',
+        'noventa': '90', 'ochenta': '80', 'setenta': '70', 'sesenta': '60', 'cincuenta': '50', 'cuarenta': '40', 'treinta': '30', 'veinte': '20', 'diez': '10'
+    };
 
-    for (const parte of partes) {
-        let p = parte.trim();
-        if (!p) continue;
+    for (const [palabra, valor] of Object.entries(mapaNumeros)) {
+        texto = texto.replace(new RegExp('\\b' + palabra + '\\b', 'g'), valor);
+    }
 
-        // 1. Buscar Fecha por Chrono ESPAÑOL
-        const chronoRes = chrono.es.parse(p, fecha_ref.toDate(), { forwardDate: true });
-        let fecha_obj = null;
-        let fecha_texto_detectado = "";
+    let fechas = [];
+    const chronoRes = chrono.es.parse(texto, fecha_ref.toDate(), { forwardDate: true });
 
-        if (chronoRes.length > 0) {
-            fecha_obj = moment(chronoRes[0].start.date()).tz('America/Guayaquil').startOf('day');
-            fecha_texto_detectado = chronoRes[0].text;
+    for (const res of chronoRes) {
+        let fecha_obj = moment(res.start.date()).tz('America/Guayaquil').startOf('day');
+        const diasSemana = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+        const mencionaDiaLiteral = diasSemana.some(d => res.text.includes(d));
+        if (mencionaDiaLiteral && fecha_obj.isSameOrBefore(fecha_ref, 'day') && !res.text.includes('hoy')) {
+            fecha_obj.add(7, 'days');
+        }
 
-            // Lógica para saltar a la próxima semana si el día detectado ya pasó o es hoy
-            const diasSemana = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
-            const mencionaDiaLiteral = diasSemana.some(d => p.includes(d));
+        fechas.push({
+            tipo: 'FECHA',
+            texto: res.text,
+            fecha_exacta: fecha_obj,
+            index: res.index
+        });
+    }
 
-            if (mencionaDiaLiteral && fecha_obj.isSameOrBefore(fecha_ref, 'day') && !p.includes('hoy')) {
-                fecha_obj.add(7, 'days');
+    const fallbacks = [
+        { regex: /\b(quincena|15 de este mes)\b/g, getFecha: (ref) => ref.date() < 15 ? ref.clone().date(15) : ref.clone().endOf('month') },
+        { regex: /\bfin de mes\b/g, getFecha: (ref) => ref.clone().endOf('month') },
+        { regex: /\b(ocho|semana|proxima semana|proxima)\b/g, getFecha: (ref) => ref.clone().add(7, 'days') },
+        { regex: /\b(quince|15 dias)\b/g, getFecha: (ref) => ref.clone().add(14, 'days') },
+        { regex: /\bhoy\b/g, getFecha: (ref) => ref.clone() },
+        { regex: /\bmañana\b/g, getFecha: (ref) => ref.clone().add(1, 'day') },
+        { regex: /\bpasado mañana\b/g, getFecha: (ref) => ref.clone().add(2, 'days') }
+    ];
+
+    for (const fb of fallbacks) {
+        let m;
+        while ((m = fb.regex.exec(texto)) !== null) {
+            let isOverlap = fechas.some(f => m.index >= f.index && m.index < (f.index + f.texto.length));
+            if (!isOverlap) {
+                fechas.push({
+                    tipo: 'FECHA',
+                    texto: m[0],
+                    fecha_exacta: fb.getFecha(fecha_ref),
+                    index: m.index
+                });
             }
         }
+    }
 
-        // 2. Fallbacks de Fecha (Quincena, Fin de mes, etc.)
-        if (!fecha_obj) {
-            fecha_obj = resolverFechaFallback(p, fecha_ref);
-            // Si el fallback resuelve algo basado en texto, lo ideal es quitarlo del monto
-            fecha_texto_detectado = ""; // En fallback no siempre tenemos el texto exacto
+    const diasDict = { 'lunes': 1, 'martes': 2, 'miércoles': 3, 'jueves': 4, 'viernes': 5, 'sábado': 6, 'domingo': 0 };
+    for (const [nombre, diaNum] of Object.entries(diasDict)) {
+        let regex = new RegExp(`\\b${nombre}\\b`, 'g');
+        let m;
+        while ((m = regex.exec(texto)) !== null) {
+            if (!fechas.some(f => m.index >= f.index && m.index < (f.index + f.texto.length))) {
+                let f = fecha_ref.clone();
+                let diff = (diaNum - f.day() + 7) % 7;
+                if (diff === 0) diff = 7;
+                fechas.push({
+                    tipo: 'FECHA',
+                    texto: m[0],
+                    fecha_exacta: f.add(diff, 'days'),
+                    index: m.index
+                });
+            }
         }
+    }
 
-        // 3. Extraer Monto Robusto
-        let texto_para_monto = p.replace(fecha_texto_detectado, "");
-
-        // Mapeo de palabras de números a dígitos
-        const mapaNumeros = {
-            'diez mil': '10000', 'cinco mil': '5000', 'cuatro mil': '4000', 'tres mil': '3000', 'dos mil': '2000', 'mil': '1000',
-            'novecientos': '900', 'ochocientos': '800', 'setecientos': '700', 'seiscientos': '600', 'quinientos': '500', 'cuatrocientos': '400', 'trescientos': '300', 'doscientos': '200', 'ciento': '100', 'cien': '100',
-            'noventa': '90', 'ochenta': '80', 'setenta': '70', 'sesenta': '60', 'cincuenta': '50', 'cuarenta': '40', 'treinta': '30', 'veinte': '20', 'diez': '10'
+    let montos = [];
+    const regexMontos = /\b(\d+(?:\.\d+)?|mitad|todo|todos|toda|resto|saldo|demas|total|completo)\b/g;
+    let p;
+    while ((p = regexMontos.exec(texto)) !== null) {
+        let matchText = p[1];
+        let isNumeric = !isNaN(parseFloat(matchText));
+        let numObj = {
+            tipo: 'MONTO',
+            texto: p[0],
+            esGesto: !isNumeric,
+            valor: isNumeric ? parseFloat(matchText) : null,
+            gesto: isNumeric ? null : matchText,
+            index: p.index
         };
 
-        for (const [palabra, valor] of Object.entries(mapaNumeros)) {
-            texto_para_monto = texto_para_monto.replace(new RegExp('\\b' + palabra + '\\b', 'g'), valor);
+        // Ignorar "montos" que realmente fueron capturados dentro del texto de una fecha (ej: "15" en "15 dias")
+        let insideFecha = fechas.some(f => numObj.index >= f.index && numObj.index < (f.index + f.texto.length));
+        if (!insideFecha) {
+            montos.push(numObj);
+        }
+    }
+
+    let tokens = [...fechas, ...montos].sort((a, b) => a.index - b.index);
+
+    let pagos_raw = [];
+    let current = { montos: [], fechaObj: null };
+
+    const finishCurrent = () => {
+        if (current.montos.length > 0 || current.fechaObj) {
+            pagos_raw.push(current);
+        }
+        current = { montos: [], fechaObj: null };
+    };
+
+    for (const t of tokens) {
+        if (t.tipo === 'MONTO') {
+            if (current.fechaObj && current.montos.length > 0) {
+                finishCurrent();
+            }
+            current.montos.push(t);
+        } else if (t.tipo === 'FECHA') {
+            if (current.fechaObj && current.montos.length > 0) {
+                finishCurrent();
+            } else if (current.fechaObj && current.montos.length === 0) {
+                finishCurrent();
+            }
+            current.fechaObj = t;
+        }
+    }
+    finishCurrent();
+
+    let pagos_procesados = [];
+    let suma_acumulada = 0;
+    let fallback_fecha = fecha_ref.clone().add(1, 'day');
+
+    for (let raw of pagos_raw) {
+        let fecha = raw.fechaObj ? raw.fechaObj.fecha_exacta : fallback_fecha;
+        if (raw.fechaObj) {
+            fallback_fecha = fecha;
         }
 
         let monto = 0;
-        const numMatch = texto_para_monto.match(/\d+(?:\.\d+)?/g);
-
-        if (numMatch) {
-            // Sumar todos los números encontrados en esta parte (ej: "mil quinientos" -> "1000 500" -> 1500)
-            monto = numMatch.reduce((acc, curr) => acc + parseFloat(curr), 0);
-        } else if (p.includes('mitad')) {
-            monto = (total_deuda / 2);
-        } else if (p.includes('todo') || p.includes('todos') || p.includes('toda') || p.includes('resto') || p.includes('saldo') || p.includes('demas') || p.includes('total') || p.includes('completo')) {
+        if (raw.montos.length > 0) {
+            if (raw.montos.some(m => m.esGesto)) {
+                let gesto = raw.montos.find(m => m.esGesto).gesto;
+                if (gesto === 'mitad') monto = total_deuda / 2;
+                else monto = Math.max(0, total_deuda - suma_acumulada);
+            } else {
+                monto = raw.montos.reduce((sum, m) => sum + m.valor, 0);
+            }
+        } else {
             monto = Math.max(0, total_deuda - suma_acumulada);
         }
 
         if (monto > 0) {
             suma_acumulada += monto;
-            pagos.push({
+            let verb_fecha = raw.fechaObj ? raw.fechaObj.texto : '';
+            let verb_amt = raw.montos.map(m => m.texto).join(' ');
+            pagos_procesados.push({
                 monto: parseFloat(monto.toFixed(2)),
-                fecha_verbal_original: p,
-                fecha_exacta: fecha_obj
+                fecha_verbal_original: [verb_amt, verb_fecha].filter(x => x).join(' '),
+                fecha_exacta: fecha
             });
         }
     }
-    pagos.sort((a, b) => a.fecha_exacta.diff(b.fecha_exacta));
-    return pagos;
-}
 
-function resolverFechaFallback(v, ref) {
-    if (v.includes('hoy')) return ref.clone();
-    if (v.includes('mañana')) return ref.clone().add(1, 'day');
-    if (v.includes('pasado mañana')) return ref.clone().add(2, 'days');
-    if (v.includes('quincena')) return ref.date() < 15 ? ref.clone().date(15) : ref.clone().endOf('month');
-    if (v.includes('fin de mes')) return ref.clone().endOf('month');
-    if (v.includes('ocho') || v.includes('semana')) return ref.clone().add(7, 'days');
-    if (v.includes('quince') || v.includes('15 dias')) return ref.clone().add(14, 'days');
-
-    // Resolución de días de la semana manual si Chrono falla
-    const diasDict = { 'lunes': 1, 'martes': 2, 'miércoles': 3, 'jueves': 4, 'viernes': 5, 'sábado': 6, 'domingo': 0 };
-    for (const [nombre, diaNum] of Object.entries(diasDict)) {
-        if (v.includes(nombre)) {
-            let f = ref.clone();
-            let diff = (diaNum - f.day() + 7) % 7;
-            if (diff === 0) diff = 7;
-            return f.add(diff, 'days');
-        }
-    }
-
-    return ref.clone().add(1, 'day');
+    pagos_procesados.sort((a, b) => a.fecha_exacta.diff(b.fecha_exacta));
+    return pagos_procesados;
 }
 
 function formatearFechaTexto(fecha) {
